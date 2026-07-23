@@ -82,13 +82,15 @@ By default the scene is centered on the most-observed AprilTag via least-squares
 triangulation (translation only). For full centering + orientation + scale from
 measured tag coordinates, place these in the parent folder:
 
-- `gcps.csv` — tag coordinates in meters, no header, e.g.:
+- `gcps.csv` — tag coordinates in meters, no header. **The script auto-generates this file if it doesn't exist** using the standard +90° orientation coordinates:
 
   ```
   36h11:00e,0,0,0
   36h11:00f,0,0.1,0
   36h11:011,0.15,0.1,0
   ```
+
+  Edit this file if your tag layout differs.
 
 - `ImportGcpParams.xml` — GCP import settings. Must be saved once from RealityScan's GUI:
   ALIGNMENT tab → Import → Ground Control Points → select `gcps.csv` → in the dialog choose

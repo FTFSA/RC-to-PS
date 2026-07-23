@@ -350,6 +350,18 @@ $DetectMarkersXml = Join-Path $ParentFolder "DetectMarkersParams.xml"
 </Configuration>
 "@ | Set-Content -Path $DetectMarkersXml -Encoding ASCII
 
+# Ground control point coordinates: standard 36h11 tags at +90° orientation
+# If gcps.csv doesn't exist, generate it with default coordinates.
+$GcpCsv = Join-Path $ParentFolder "gcps.csv"
+if (-not (Test-Path $GcpCsv)) {
+    @"
+36h11:00e,0,0,0
+36h11:00f,0,0.1,0
+36h11:011,0.15,0.1,0
+"@ | Set-Content -Path $GcpCsv -Encoding ASCII
+    Write-Host "Generated default gcps.csv with standard tag coordinates."
+}
+
 # Ground control point import settings: RealityScan requires this file to be
 # saved from its GUI dialog (see header). The script never generates it.
 $GcpParamsXml = Join-Path $ParentFolder "ImportGcpParams.xml"
@@ -433,7 +445,6 @@ $rcArgs = @(
 # Ground control points: center/orient/scale the scene on the AprilTags.
 # Requires at least 3 tags with measured coordinates in gcps.csv.
 $UsedGcp = $false
-$GcpCsv = Join-Path $ParentFolder "gcps.csv"
 if ((Test-Path $GcpCsv) -and (Test-Path $GcpParamsXml)) {
     Write-Host "Using ground control points: $GcpCsv"
     $rcArgs += @("-importGroundControlPoints", "`"$GcpCsv`"", "`"$GcpParamsXml`"")
