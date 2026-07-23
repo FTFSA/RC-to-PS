@@ -474,6 +474,7 @@ $alignmentSettings = @(
     "sfmControlPointXAccuracy=0.001"
     "sfmControlPointYAccuracy=0.001"
     "sfmControlPointZAccuracy=0.001"
+    "sfmDefinedDistanceAccuracy=0.001"
     # Advanced
     "sfmAutoReconRegionAfterAlignment=true"
     "sfmForceComponentRematch=false"
