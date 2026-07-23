@@ -456,6 +456,37 @@ Write-Host "`nLaunching RealityScan (align + export)..."
 # explicit quotes to support folders with spaces (e.g. "Chris Berry").
 $rcArgs = @(
     "-newScene"
+)
+
+# Alignment settings (per realityscan-postshot-settings reference doc). Pinned
+# explicitly so runs don't depend on whatever the app's current defaults are.
+$alignmentSettings = @(
+    "sfmFeatureDetectionQuality=High"
+    "sfmMaxFeaturesPerMpx=10000"
+    "sfmMaxFeaturesPerImage=80000"
+    "sfmImagesOverlap=Medium"
+    "sfmImageDownscaleFactor=1"
+    "sfmMaxFeatureReprojectionError=2.0"
+    # Camera priors: off (static rig; GCPs handle georeferencing)
+    "sfmEnableCameraPrior=false"
+    # Control point priors: tag centers detect very precisely
+    "sfmControPointImageMeasAccuracy=0.5"
+    "sfmControlPointXAccuracy=0.001"
+    "sfmControlPointYAccuracy=0.001"
+    "sfmControlPointZAccuracy=0.001"
+    # Advanced
+    "sfmAutoReconRegionAfterAlignment=true"
+    "sfmForceComponentRematch=false"
+    "sfmPreselectorFeatures=10000"
+    "sfmDetectorSensitivity=High"
+    "sfmMergeGeoreferencedComponents=false"
+    "sfmDistortionModel=Brown3"
+)
+foreach ($s in $alignmentSettings) {
+    $rcArgs += @("-set", "`"$s`"")
+}
+
+$rcArgs += @(
     "-addFolder",              "`"$ImagesFolder`""
 )
 
@@ -538,7 +569,9 @@ Write-Host "`nStarting PostShot training ($($importFiles.Count) inputs) - this c
 
 $psArgs = @("train", "-i")
 $psArgs += $importFiles
-$psArgs += @("--profile", "Splat MCMC")
+# --no-recenter-points: keep the RealityScan coordinate frame (tag-centered,
+# metric) instead of letting PostShot recenter poses/points to its own origin.
+$psArgs += @("--profile", "Splat MCMC", "--no-recenter-points")
 if ($SmokeTest) {
     $psArgs += @("-s", $SmokeTestTrainSteps.ToString(), "--max-num-splats", $SmokeTestMaxSplats.ToString(), "--max-image-size", $SmokeTestMaxImageSize.ToString())
 }
