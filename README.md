@@ -95,10 +95,11 @@ measured tag coordinates, place these in the parent folder:
   parent folders zero-setup. Pass `-OverwriteGcps` to refresh a folder that already has an
   older `gcps.csv`. Edit the repo template if your tag layout ever changes.
 
-- `ImportGcpParams.xml` — GCP import settings. Must be saved once from RealityScan's GUI:
-  ALIGNMENT tab → Import → Ground Control Points → select `gcps.csv` → in the dialog choose
-  format `Point X/Lon Y/Lat Z/Alt` and coordinate system `local:1 - Euclidean` → click the
-  save-settings (down-arrow) icon → save to this file.
+- `ImportGcpParams.xml` — GCP import settings (format `Point X/Lon Y/Lat Z/Alt`, coordinate
+  system `local:1 - Euclidean`, ground-control type, 1 mm position accuracy). **Bundled in
+  this repo and copied into the parent folder automatically** (also refreshed by
+  `-OverwriteGcps`). With both files present, the script imports GCPs and RealityScan
+  centers, orients, and scales the scene to the tag coordinates — no triangulation fallback.
 
 ## Notes
 

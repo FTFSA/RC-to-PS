@@ -12,12 +12,10 @@
 #                                "36h11:011" 0.1500000000000000 0.1000000000000000 0.0000000000000000
 #                                "36h11:00e" 0.0000000000000000 0.0000000000000000 0.0000000000000000
 #                                "36h11:00f" 0.0000000000000000 0.1000000000000000 0.0000000000000000
-#   ImportGcpParams.xml     -- GCP import settings. Save ONCE from RealityScan:
-#                              ALIGNMENT tab > Import > Ground Control Points >
-#                              select gcps.csv > in the import dialog choose
-#                              format 'Point X/Lon Y/Lat Z/Alt' and coordinate
-#                              system 'local:1 - Euclidean' > click the save
-#                              settings (down-arrow) icon > save to this file.
+#   ImportGcpParams.xml     -- GCP import settings (format 'Point X/Lon Y/Lat
+#                              Z/Alt', coordinate system 'local:1 - Euclidean',
+#                              1 mm position accuracy). Bundled in the repo and
+#                              copied into the parent folder automatically.
 #
 # Outputs (written into the images subfolder):
 #   registration.csv        -- Internal/External camera parameters
@@ -379,9 +377,17 @@ if ($ShouldWriteBundledGcps) {
     Write-Host "Using existing gcps.csv: $GcpCsv"
 }
 
-# Ground control point import settings: RealityScan requires this file to be
-# saved from its GUI dialog (see header). The script never generates it.
+# Ground control point import settings: originally saved from RealityScan's GUI
+# dialog (see header) and now bundled in the repo. Copy it into the parent
+# folder if missing (or when -OverwriteGcps is used), same as gcps.csv.
 $GcpParamsXml = Join-Path $ParentFolder "ImportGcpParams.xml"
+$BundledGcpParamsXml = if ($PSScriptRoot) { Join-Path $PSScriptRoot "ImportGcpParams.xml" } else { $null }
+if ($BundledGcpParamsXml -and (Test-Path $BundledGcpParamsXml)) {
+    if ((-not (Test-Path $GcpParamsXml)) -or $OverwriteGcps) {
+        Copy-Item -Path $BundledGcpParamsXml -Destination $GcpParamsXml -Force
+        Write-Host "Copied bundled ImportGcpParams.xml into the parent folder."
+    }
+}
 
 # Registration: "Internal/External Camera Parameters" CSV format
 $RegParamsXml = Join-Path $ParentFolder "ExportRegParams.xml"
