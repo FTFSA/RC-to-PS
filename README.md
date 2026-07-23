@@ -58,6 +58,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\rc_to_postshot.ps1 `
 |---|---|---|
 | `-ParentFolder` | (required) | Folder containing the images subfolder; settings XMLs and full-run outputs go here |
 | `-ImagesFolder` | auto-detect | Path to the images folder directly |
+| `-OverwriteGcps` | off | Overwrite `ParentFolder\gcps.csv` with the bundled scale-bar template |
 | `-SmokeTest` | off | Fast test run on a small image subset |
 | `-SmokeTestImageCount` | 8 | Images to copy in smoke-test mode |
 | `-SmokeTestTrainSteps` | 2 | Training limit (kSteps) in smoke-test mode |
@@ -82,15 +83,17 @@ By default the scene is centered on the most-observed AprilTag via least-squares
 triangulation (translation only). For full centering + orientation + scale from
 measured tag coordinates, place these in the parent folder:
 
-- `gcps.csv` — tag coordinates in meters, no header. **The script auto-generates this file if it doesn't exist** using the standard +90° orientation coordinates:
+- `gcps.csv` — tag coordinates in meters, no header. **If the parent folder doesn't have one, the script copies the bundled template (`gcps.csv` in this repo)**, which holds the Scan Space NZ 10×15 cm tag36h11 scale-bar coordinates at +90° orientation:
 
   ```
-  36h11:00e,0,0,0
-  36h11:00f,0,0.1,0
-  36h11:011,0.15,0.1,0
+  "36h11:011" 0.15 0.1 0
+  "36h11:00e" 0    0   0
+  "36h11:00f" 0    0.1 0
   ```
 
-  Edit this file if your tag layout differs.
+  Since the same scale bar is used for every capture, this makes batch runs across many
+  parent folders zero-setup. Pass `-OverwriteGcps` to refresh a folder that already has an
+  older `gcps.csv`. Edit the repo template if your tag layout ever changes.
 
 - `ImportGcpParams.xml` — GCP import settings. Must be saved once from RealityScan's GUI:
   ALIGNMENT tab → Import → Ground Control Points → select `gcps.csv` → in the dialog choose

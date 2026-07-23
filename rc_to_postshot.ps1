@@ -6,11 +6,12 @@
 #               <images-subfolder>\   <-- any single subfolder containing your images
 #
 # Optional inputs (in the parent folder) to center the scene on the AprilTags:
-#   gcps.csv                -- measured tag coordinates (Name,X,Y,Z in meters,
-#                              no header). Needs at least 3 tags, e.g.:
-#                                36h11:00b,0,0,0
-#                                36h11:00c,0.30,0,0
-#                                36h11:00d,0,0.25,0
+#   gcps.csv                -- measured tag coordinates in meters, no header.
+#                              If missing, the script copies the bundled
+#                              tag36h11 scale-bar template from the repo:
+#                                "36h11:011" 0.1500000000000000 0.1000000000000000 0.0000000000000000
+#                                "36h11:00e" 0.0000000000000000 0.0000000000000000 0.0000000000000000
+#                                "36h11:00f" 0.0000000000000000 0.1000000000000000 0.0000000000000000
 #   ImportGcpParams.xml     -- GCP import settings. Save ONCE from RealityScan:
 #                              ALIGNMENT tab > Import > Ground Control Points >
 #                              select gcps.csv > in the import dialog choose
@@ -32,6 +33,9 @@ param(
 
     [Parameter(Mandatory = $false, HelpMessage = "Optional: path to the images folder directly (skips auto-detect of the single subfolder)")]
     [string]$ImagesFolder,
+
+    [Parameter(Mandatory = $false, HelpMessage = "Overwrite ParentFolder\gcps.csv with the bundled tag36h11 scale-bar coordinates before running.")]
+    [switch]$OverwriteGcps,
 
     [Parameter(Mandatory = $false, HelpMessage = "Enable a fast smoke-test run (copies a subset of images into a *_smoketest folder).")]
     [switch]$SmokeTest,
@@ -350,16 +354,29 @@ $DetectMarkersXml = Join-Path $ParentFolder "DetectMarkersParams.xml"
 </Configuration>
 "@ | Set-Content -Path $DetectMarkersXml -Encoding ASCII
 
-# Ground control point coordinates: standard 36h11 tags at +90° orientation
-# If gcps.csv doesn't exist, generate it with default coordinates.
+# Ground control point coordinates: Scan Space NZ tag36h11 scale bar at +90° orientation.
+# If gcps.csv doesn't exist, copy the bundled template from the repo. Use
+# -OverwriteGcps to refresh an existing capture folder with the bundled template.
 $GcpCsv = Join-Path $ParentFolder "gcps.csv"
-if (-not (Test-Path $GcpCsv)) {
-    @"
-36h11:00e,0,0,0
-36h11:00f,0,0.1,0
-36h11:011,0.15,0.1,0
-"@ | Set-Content -Path $GcpCsv -Encoding ASCII
-    Write-Host "Generated default gcps.csv with standard tag coordinates."
+$BundledGcpCsv = if ($PSScriptRoot) { Join-Path $PSScriptRoot "gcps.csv" } else { $null }
+$ShouldWriteBundledGcps = (-not (Test-Path $GcpCsv)) -or $OverwriteGcps
+if ($ShouldWriteBundledGcps) {
+    if ($BundledGcpCsv -and (Test-Path $BundledGcpCsv)) {
+        Copy-Item -Path $BundledGcpCsv -Destination $GcpCsv -Force
+    } else {
+        @'
+"36h11:011" 0.1500000000000000 0.1000000000000000 0.0000000000000000
+"36h11:00e" 0.0000000000000000 0.0000000000000000 0.0000000000000000
+"36h11:00f" 0.0000000000000000 0.1000000000000000 0.0000000000000000
+'@ | Set-Content -Path $GcpCsv -Encoding ASCII
+    }
+    if ($OverwriteGcps) {
+        Write-Host "Overwrote gcps.csv with bundled tag36h11 scale-bar coordinates."
+    } else {
+        Write-Host "Generated gcps.csv with bundled tag36h11 scale-bar coordinates."
+    }
+} else {
+    Write-Host "Using existing gcps.csv: $GcpCsv"
 }
 
 # Ground control point import settings: RealityScan requires this file to be
