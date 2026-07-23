@@ -1,0 +1,12 @@
+# Capture data / generated outputs - never commit these
+*.psht
+*.ply
+*.JPG
+*.jpg
+*.jpeg
+*.png
+*.tif
+*.tiff
+registration.csv
+tag_measurements.csv
+*_smoketest/
