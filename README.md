@@ -109,7 +109,7 @@ measured tag coordinates, place these in the parent folder:
   detection quality, 80k max features/image, downscale factor 1, Brown3 distortion, camera
   priors off, 1 mm control-point accuracy, etc.), so runs don't depend on the app's current
   GUI defaults. See `$alignmentSettings` in the script to adjust.
-- Postshot training uses the `Splat MCMC` profile with `--no-recenter-points`, preserving
-  the tag-centered metric coordinate frame from RealityScan.
+- Postshot training uses the `Splat MCMC` profile. Poses and points are recentered to the
+  world origin by Postshot's default behavior.
 - `postshot-cli` has no photometric compensation flag as of v1.1; enable it in the Postshot GUI
   if needed after opening the project.

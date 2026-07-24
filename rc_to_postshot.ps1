@@ -576,9 +576,7 @@ Write-Host "`nStarting PostShot training ($($importFiles.Count) inputs) - this c
 
 $psArgs = @("train", "-i")
 $psArgs += $importFiles
-# --no-recenter-points: keep the RealityScan coordinate frame (tag-centered,
-# metric) instead of letting PostShot recenter poses/points to its own origin.
-$psArgs += @("--profile", "Splat MCMC", "--no-recenter-points")
+$psArgs += @("--profile", "Splat MCMC")
 if ($SmokeTest) {
     $psArgs += @("-s", $SmokeTestTrainSteps.ToString(), "--max-num-splats", $SmokeTestMaxSplats.ToString(), "--max-image-size", $SmokeTestMaxImageSize.ToString())
 }
