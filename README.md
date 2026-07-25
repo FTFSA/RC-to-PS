@@ -60,7 +60,8 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\rc_to_postshot.ps1 `
 ```
 
 `-ImagesFolder` is optional — if omitted, the script uses the first subfolder inside
-`-ParentFolder` (ignoring `*_smoketest` folders from earlier runs).
+`-ParentFolder` (ignoring the pipeline's own `*_smoketest`, `*_align`, and
+`rs_crash_reports` folders).
 
 ### Parameters
 
@@ -95,8 +96,8 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\rc_to_postshot.ps1 `
 - `ParentFolder\sparse_point_cloud.ply` — sparse tie points (QC + automatic fallback if
   the dense export ever fails; dense mode only)
 - `ParentFolder\tag_measurements.csv` — AprilTag image measurements (QC artifact)
-- `ParentFolder\<capture>.rsproj` — RealityScan project saved after alignment (open in
-  the GUI to debug a bad run)
+- `ParentFolder\<capture>_align.rsproj` (+ `<capture>_align\` data folder) — RealityScan
+  project saved after alignment (open in the GUI to debug a bad run)
 - `ParentFolder\rs_progress.log` — RealityScan progress feed (watch it to monitor long runs)
 - `ParentFolder\rs_crash_reports\` — crash reports, if RealityScan ever crashes
 - `ParentFolder\<capture>.psht` — trained Postshot project (opened in GUI at the end)
@@ -143,9 +144,11 @@ scene will then be unscaled and uncentered.
 
 ## Notes
 
-- The script writes `DetectMarkersParams.xml`, `ExportRegParams.xml`,
-  `ExportPlyParams.xml`, and `DenseExportParams.xml` into the parent folder on every
-  run (no manual setup needed).
+- The script writes `DetectMarkersParams.xml`, `ExportRegParams.xml`, and
+  `ExportPlyParams.xml` into the parent folder on every run (no manual setup needed).
+  The dense model export deliberately runs without a params file — RealityScan's
+  ModelExport params schema is undocumented and a wrong file makes the export silently
+  no-op; the result is validated after the run instead.
 - RealityScan alignment settings are pinned explicitly via `-set` commands (High feature
   detection quality, 80k max features/image, downscale factor 1, Brown3 distortion,
   camera priors off, 1 mm control-point accuracy, etc.), so runs don't depend on the
@@ -158,8 +161,12 @@ scene will then be unscaled and uncentered.
   default the script meshes at Preview quality (CPU-based), simplifies to
   `-DenseTargetTris` triangles (~half that in points, targeting ~1–3M), colorizes, and
   exports the vertices as the init cloud. The exported PLY is validated (binary, RGB
-  colors, faces stripped if present); on any problem the run falls back to the sparse
-  cloud with a warning. Use `-SparseInit` to A/B the old behavior.
+  colors, faces stripped if present, coordinate frame cross-checked against the sparse
+  cloud); on any problem the run falls back to the sparse cloud with a warning. Use
+  `-SparseInit` to A/B the old behavior.
+- Outputs are also checked for freshness (a file left over from an earlier run can
+  never fake success), and the run fails fast at startup if a previous run's `.psht`
+  is still open — and therefore locked — in a PostShot window.
 - Postshot training uses the `Splat MCMC` profile, pinned explicitly (Postshot's
   default profile changed to `Splat3` in v1.1), with `--no-recenter-points` so the
   tag-anchored frame is preserved — tag `00e` at the origin, tag plane at Z = 0

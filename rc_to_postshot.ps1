@@ -113,6 +113,11 @@ param(
 
 Set-StrictMode -Version Latest
 
+# Anything this run produces must be newer than this moment - guards against
+# stale files from earlier runs masquerading as fresh outputs (postshot-cli has
+# been seen returning exit 0 after aborting).
+$RunStart = (Get-Date).AddSeconds(-5)
+
 $SupportedImageExts = @(".jpg", ".jpeg", ".png", ".tif", ".tiff", ".bmp", ".exr")
 
 function Assert-Path([string]$path, [string]$label) {
@@ -122,24 +127,46 @@ function Assert-Path([string]$path, [string]$label) {
     }
 }
 
-function Test-AndFixDensePly([string]$PlyPath) {
-    # Validates that $PlyPath is a binary little-endian PLY point cloud with
-    # xyz + red/green/blue vertex properties. RealityScan's model export may
-    # include a face block; if so, rewrite the file as a vertex-only cloud
-    # (PostShot wants points, not a mesh). Returns $true when usable.
-    if (-not (Test-Path $PlyPath)) { Write-Warning "Dense cloud missing: $PlyPath"; return $false }
+function Assert-FreshOutput([string]$path, [string]$label) {
+    # Like Assert-Path, but the file must also have been (re)written by THIS
+    # run - stale outputs from earlier runs must not fake success.
+    Assert-Path $path $label
+    if ((Get-Item $path).LastWriteTime -lt $RunStart) {
+        Write-Error "$label exists but was not updated by this run (stale leftover from a previous run): $path"
+        exit 1
+    }
+}
+
+function Assert-Writable([string]$path, [string]$label) {
+    # Fails fast when an existing output file is locked (typically by a
+    # PostShot window still showing a previous run's project).
+    if (Test-Path $path) {
+        try {
+            $fs = [System.IO.File]::Open($path, 'Open', 'ReadWrite', 'None')
+            $fs.Close()
+        } catch {
+            Write-Error "$label is locked by another program (likely a PostShot window showing an earlier run) - close it and re-run: $path"
+            exit 1
+        }
+    }
+}
+
+function Get-PlyInfo([string]$PlyPath) {
+    # Parses a binary little-endian PLY header. Returns $null when the file is
+    # missing or not a supported layout; otherwise a hashtable with the raw
+    # Bytes, DataStart offset, vertex Count/Stride/PropTypes/PropNames, and
+    # the names of any ExtraElements after the vertex block.
+    if (-not (Test-Path $PlyPath)) { return $null }
     $bytes = [System.IO.File]::ReadAllBytes($PlyPath)
     $headLen = [Math]::Min(8192, $bytes.Length)
     $head = [System.Text.Encoding]::ASCII.GetString($bytes, 0, $headLen)
     $ehIdx = $head.IndexOf("end_header")
-    if ($ehIdx -lt 0) { Write-Warning "Dense PLY: no end_header found."; return $false }
+    if ($ehIdx -lt 0) { return $null }
     $nlIdx = $head.IndexOf("`n", $ehIdx)
-    if ($nlIdx -lt 0) { Write-Warning "Dense PLY: malformed header."; return $false }
-    $dataStart = $nlIdx + 1
+    if ($nlIdx -lt 0) { return $null }
     $headerText = $head.Substring(0, $ehIdx)
-    if ($headerText -notmatch "format binary_little_endian") { Write-Warning "Dense PLY is not binary little-endian."; return $false }
+    if ($headerText -notmatch "format binary_little_endian") { return $null }
 
-    # Parse elements and their properties in file order
     $elements = @()
     $cur = $null
     foreach ($rawLine in ($headerText -split "`n")) {
@@ -156,45 +183,155 @@ function Test-AndFixDensePly([string]$PlyPath) {
             }
         }
     }
-    if ($elements.Count -eq 0 -or $elements[0].Name -ne "vertex") { Write-Warning "Dense PLY: first element is not 'vertex'."; return $false }
+    if ($elements.Count -eq 0 -or $elements[0].Name -ne "vertex") { return $null }
     $v = $elements[0]
-    if ($v.HasList) { Write-Warning "Dense PLY: vertex element has a list property - unsupported layout."; return $false }
+    if ($v.HasList) { return $null }
     $typeSize = @{ char = 1; uchar = 1; int8 = 1; uint8 = 1; short = 2; ushort = 2; int16 = 2; uint16 = 2;
                    int = 4; uint = 4; int32 = 4; uint32 = 4; float = 4; float32 = 4; double = 8; float64 = 8 }
     $stride = 0
     foreach ($t in $v.PropTypes) {
-        if (-not $typeSize.ContainsKey($t)) { Write-Warning "Dense PLY: unknown property type '$t'."; return $false }
+        if (-not $typeSize.ContainsKey($t)) { return $null }
         $stride += $typeSize[$t]
     }
-    if (-not (($v.PropNames -contains "red") -and ($v.PropNames -contains "green") -and ($v.PropNames -contains "blue"))) {
-        Write-Warning "Dense PLY has no vertex colors (red/green/blue missing) - PostShot needs colored points."
-        return $false
+    return @{
+        Bytes = $bytes; DataStart = $nlIdx + 1
+        Count = $v.Count; Stride = $stride
+        PropTypes = $v.PropTypes; PropNames = $v.PropNames
+        ExtraElements = @($elements | Select-Object -Skip 1 | ForEach-Object { $_.Name })
     }
-    if ($v.Count -lt 1000) { Write-Warning "Dense PLY has only $($v.Count) vertices."; return $false }
+}
 
-    if ($elements.Count -eq 1) {
-        Write-Host "Dense cloud OK: $($v.Count) colored points."
+# Fast vertex repacker (PowerShell loops are too slow for millions of points).
+Add-Type -TypeDefinition @"
+public static class RsPlyRepack
+{
+    public static byte[] Repack(byte[] src, int dataStart, int count, int stride,
+                                int posOff, int colOff, bool floatColors, bool scale01, byte[] header)
+    {
+        byte[] dst = new byte[header.Length + count * 15];
+        System.Buffer.BlockCopy(header, 0, dst, 0, header.Length);
+        int o = header.Length;
+        for (int i = 0; i < count; i++)
+        {
+            int s = dataStart + i * stride;
+            System.Buffer.BlockCopy(src, s + posOff, dst, o, 12);
+            if (floatColors)
+            {
+                for (int k = 0; k < 3; k++)
+                {
+                    float c = System.BitConverter.ToSingle(src, s + colOff + 4 * k);
+                    if (scale01) c *= 255f;
+                    if (c < 0f) c = 0f;
+                    if (c > 255f) c = 255f;
+                    dst[o + 12 + k] = (byte)(c + 0.5f);
+                }
+            }
+            else
+            {
+                dst[o + 12] = src[s + colOff];
+                dst[o + 13] = src[s + colOff + 1];
+                dst[o + 14] = src[s + colOff + 2];
+            }
+            o += 15;
+        }
+        return dst;
+    }
+}
+"@
+
+function Test-AndFixDensePly([string]$PlyPath) {
+    # Ensures $PlyPath is a point cloud in the exact layout PostShot's importer
+    # accepts: binary little-endian, float x,y,z + uchar red,green,blue, no
+    # faces. RealityScan's model export writes FLOAT colors (0..1) and a face
+    # block - PostShot silently reads that as an EMPTY cloud - so anything
+    # non-canonical is repacked in place. Returns $true when usable.
+    $info = Get-PlyInfo $PlyPath
+    if ($null -eq $info) { Write-Warning "Dense PLY missing or not a supported binary little-endian layout: $PlyPath"; return $false }
+    if ($info.Count -lt 1000) { Write-Warning "Dense PLY has only $($info.Count) vertices."; return $false }
+
+    # Locate x,y,z (three consecutive floats) and red,green,blue (consecutive,
+    # all float or all uchar) among the vertex properties.
+    $typeSize = @{ char = 1; uchar = 1; int8 = 1; uint8 = 1; short = 2; ushort = 2; int16 = 2; uint16 = 2;
+                   int = 4; uint = 4; int32 = 4; uint32 = 4; float = 4; float32 = 4; double = 8; float64 = 8 }
+    $offsets = @{}
+    $off = 0
+    for ($i = 0; $i -lt $info.PropNames.Count; $i++) {
+        $offsets[$info.PropNames[$i]] = @{ Offset = $off; Type = $info.PropTypes[$i]; Index = $i }
+        $off += $typeSize[$info.PropTypes[$i]]
+    }
+    foreach ($n in @("x", "y", "z", "red", "green", "blue")) {
+        if (-not $offsets.ContainsKey($n)) { Write-Warning "Dense PLY is missing vertex property '$n' - PostShot needs colored points."; return $false }
+    }
+    $floatTypes = @("float", "float32")
+    if (($offsets["x"].Type -notin $floatTypes) -or ($offsets["y"].Index -ne $offsets["x"].Index + 1) -or ($offsets["z"].Index -ne $offsets["x"].Index + 2)) {
+        Write-Warning "Dense PLY has an unsupported position layout."; return $false
+    }
+    $colType = $offsets["red"].Type
+    if (($offsets["green"].Index -ne $offsets["red"].Index + 1) -or ($offsets["blue"].Index -ne $offsets["red"].Index + 2) -or ($offsets["green"].Type -ne $colType) -or ($offsets["blue"].Type -ne $colType)) {
+        Write-Warning "Dense PLY has an unsupported color layout."; return $false
+    }
+    $floatColors = $colType -in $floatTypes
+    if (-not $floatColors -and $colType -notin @("uchar", "uint8")) {
+        Write-Warning "Dense PLY has unsupported color type '$colType'."; return $false
+    }
+
+    $vertexBytes = [long]$info.Count * $info.Stride
+    if ($info.DataStart + $vertexBytes -gt $info.Bytes.LongLength) { Write-Warning "Dense PLY truncated - vertex data shorter than header promises."; return $false }
+
+    # Already canonical? (exactly x,y,z float + r,g,b uchar, nothing else)
+    if (-not $floatColors -and $info.Stride -eq 15 -and $info.PropNames.Count -eq 6 -and $offsets["x"].Offset -eq 0 -and $offsets["red"].Offset -eq 12 -and $info.ExtraElements.Count -eq 0) {
+        Write-Host "Dense cloud OK: $($info.Count) colored points."
         return $true
     }
 
-    # Extra elements (faces etc.): keep only the vertex block
-    $extra = @($elements | Select-Object -Skip 1 | ForEach-Object { $_.Name }) -join ", "
-    Write-Host "Dense PLY contains extra elements ($extra) - stripping to a pure point cloud."
-    $vertexBytes = [long]$v.Count * $stride
-    if ($dataStart + $vertexBytes -gt $bytes.LongLength) { Write-Warning "Dense PLY truncated - vertex data shorter than header promises."; return $false }
-    $nl = "`n"
-    $newHeader = "ply$nl" + "format binary_little_endian 1.0$nl" + "element vertex $($v.Count)$nl"
-    for ($i = 0; $i -lt $v.PropTypes.Count; $i++) {
-        $newHeader += "property $($v.PropTypes[$i]) $($v.PropNames[$i])$nl"
+    # Float colors: detect 0..1 vs 0..255 range from a sample
+    $scale01 = $false
+    if ($floatColors) {
+        $maxC = 0.0
+        $step = [Math]::Max(1, [Math]::Floor($info.Count / 2000))
+        for ($i = 0; $i -lt $info.Count; $i += $step) {
+            $vo = $info.DataStart + $i * $info.Stride + $offsets["red"].Offset
+            for ($k = 0; $k -lt 3; $k++) {
+                $c = [BitConverter]::ToSingle($info.Bytes, $vo + 4 * $k)
+                if ($c -gt $maxC) { $maxC = $c }
+            }
+        }
+        $scale01 = $maxC -le 1.001
     }
-    $newHeader += "end_header$nl"
+
+    Write-Host "Repacking dense PLY to PostShot's layout (float xyz + uchar rgb$(if ($info.ExtraElements.Count) { ", dropping " + ($info.ExtraElements -join ', ') }))..."
+    $nl = "`n"
+    $newHeader = "ply$nl" + "format binary_little_endian 1.0$nl" + "element vertex $($info.Count)$nl" +
+        "property float x$nl" + "property float y$nl" + "property float z$nl" +
+        "property uchar red$nl" + "property uchar green$nl" + "property uchar blue$nl" + "end_header$nl"
     $hb = [System.Text.Encoding]::ASCII.GetBytes($newHeader)
-    $out = New-Object byte[] ($hb.Length + $vertexBytes)
-    [Array]::Copy($hb, 0, $out, 0, $hb.Length)
-    [Array]::Copy($bytes, $dataStart, $out, $hb.Length, $vertexBytes)
+    $out = [RsPlyRepack]::Repack($info.Bytes, [int]$info.DataStart, [int]$info.Count, [int]$info.Stride,
+        [int]$offsets["x"].Offset, [int]$offsets["red"].Offset, $floatColors, $scale01, $hb)
     [System.IO.File]::WriteAllBytes($PlyPath, $out)
-    Write-Host "Dense cloud OK after strip: $($v.Count) colored points."
+    Write-Host "Dense cloud OK after repack: $($info.Count) colored points."
     return $true
+}
+
+function Get-PlyBounds([string]$PlyPath) {
+    # Samples up to ~100k vertices and returns @{Min=@(x,y,z); Max=@(x,y,z)},
+    # or $null when the layout isn't float x,y,z-first.
+    $info = Get-PlyInfo $PlyPath
+    if ($null -eq $info -or $info.Count -lt 1) { return $null }
+    if ($info.PropNames.Count -lt 3 -or
+        $info.PropNames[0] -ne "x" -or $info.PropNames[1] -ne "y" -or $info.PropNames[2] -ne "z" -or
+        ($info.PropTypes[0] -notin @("float", "float32"))) { return $null }
+    $step = [Math]::Max(1, [Math]::Floor($info.Count / 100000))
+    $mins = @([double]::MaxValue, [double]::MaxValue, [double]::MaxValue)
+    $maxs = @([double]::MinValue, [double]::MinValue, [double]::MinValue)
+    for ($i = 0; $i -lt $info.Count; $i += $step) {
+        $off = $info.DataStart + $i * $info.Stride
+        for ($k = 0; $k -lt 3; $k++) {
+            $val = [BitConverter]::ToSingle($info.Bytes, $off + 4 * $k)
+            if ($val -lt $mins[$k]) { $mins[$k] = $val }
+            if ($val -gt $maxs[$k]) { $maxs[$k] = $val }
+        }
+    }
+    return @{ Min = $mins; Max = $maxs }
 }
 
 # -- Validate inputs ---------------------------------------------------
@@ -208,8 +345,11 @@ if ($ImagesFolder) {
     Assert-Path $ImagesFolder "Images folder (override)"
     $ImagesFolder = (Resolve-Path $ImagesFolder).Path
 } else {
-    # Ignore *_smoketest folders left behind by earlier smoke runs
-    $subfolders = @(Get-ChildItem -Path $ParentFolder -Directory | Where-Object { $_.Name -notlike "*_smoketest" })
+    # Ignore folders this pipeline creates itself (smoke subsets, the RealityScan
+    # project's sidecar data folder, crash reports)
+    $subfolders = @(Get-ChildItem -Path $ParentFolder -Directory | Where-Object {
+        $_.Name -notlike "*_smoketest" -and $_.Name -notlike "*_align" -and $_.Name -ne "rs_crash_reports"
+    })
 
     if ($subfolders.Count -eq 0) {
         Write-Error "No subfolders found inside: $ParentFolder"
@@ -272,11 +412,19 @@ $DensePointCloudPLY  = Join-Path $ImagesFolder "dense_point_cloud.ply"
 # cloud goes to the parent as a QC/fallback artifact. -SparseInit swaps that.
 $SparsePointCloudPLY = if ($SparseInit) { Join-Path $ImagesFolder "sparse_point_cloud.ply" } else { Join-Path $ParentFolder "sparse_point_cloud.ply" }
 $TagMeasurementsCSV  = if ($SmokeTest) { Join-Path $ParentFolder "tag_measurements_smoketest.csv" } else { Join-Path $ParentFolder "tag_measurements.csv" }
-$RsProjFile          = Join-Path $ParentFolder ($CaptureName + ".rsproj")
+# NOTE: saving <name>.rsproj makes RealityScan create a sidecar data folder
+# named <name>\ next to it - the "_align" suffix keeps that folder from
+# colliding with the images folder (which must stay clean for PostShot).
+$RsProjFile          = Join-Path $ParentFolder ($CaptureName + "_align.rsproj")
 $RsProgressLog       = Join-Path $ParentFolder "rs_progress.log"
 $RsCrashDir          = Join-Path $ParentFolder "rs_crash_reports"
 $ProjectFile         = Join-Path $ParentFolder ($CaptureName + ".psht")
 $SplatFile           = Join-Path $ParentFolder ($CaptureName + "-splat.ply")
+
+# Fail fast if a previous run's outputs are still open in PostShot - training
+# would otherwise abort hours later when it tries to write them.
+Assert-Writable $ProjectFile "PostShot project output"
+Assert-Writable $SplatFile   "Splat output"
 
 # -- Write settings files (kept in the parent folder) ------------------
 # Marker detection: AprilTag 36h11
@@ -393,22 +541,6 @@ $PlyParamsXml = Join-Path $ParentFolder "ExportPlyParams.xml"
 </Configuration>
 "@ | Set-Content -Path $PlyParamsXml -Encoding ASCII
 
-# Dense init cloud: model export as binary PLY, vertices + colors only.
-# NOTE: ModelExport params use a different schema than the other exports
-# (attributes on a single tag). exportInfoFile=1 makes RealityScan write a
-# .rsinfo next to the export recording its actual interpretation.
-$DenseExportXml = Join-Path $ParentFolder "DenseExportParams.xml"
-if (-not $SparseInit) {
-@"
-<ModelExport exportBinary="1" exportInfoFile="1"
-  exportVertices="1" exportVertexColors="1" exportVertexNormals="0"
-  exportTriangles="0" exportTriangleStrips="0"
-  exportCoordinateSystemType="0"
-  settingsAnchor="0 0 0" settingsRotation="0 0 0" settingsScale="1 1 1"
-  formatAndVersionUID="ply 000 "/>
-"@ | Set-Content -Path $DenseExportXml -Encoding ASCII
-}
-
 # -- Run RealityScan via CLI -------------------------------------------
 Write-Host "`nLaunching RealityScan (align + export)..."
 
@@ -501,12 +633,15 @@ if (-not $SparseInit) {
     # Dense init: mesh at the chosen quality, simplify to the triangle target
     # (vertex count ~ half of it), colorize (models are born uncolored), then
     # export the vertices as the dense cloud. Each command operates on the
-    # last-created model, so no explicit selection is needed.
+    # last-created model, so no explicit selection is needed. The export runs
+    # WITHOUT a params file (RealityScan's ModelExport params schema is
+    # undocumented and a wrong file makes the export silently no-op) - the
+    # format comes from the .ply extension and the result is validated below.
     $rcArgs += @(
         "-calculate${DenseQuality}Model"
         "-simplify",            $DenseTargetTris.ToString()
         "-calculateVertexColors"
-        "-exportSelectedModel", "`"$DensePointCloudPLY`"", "`"$DenseExportXml`""
+        "-exportSelectedModel", "`"$DensePointCloudPLY`""
     )
 }
 
@@ -533,9 +668,10 @@ if ($rcExit -ne 0) {
     exit $rcExit
 }
 
-# Verify the outputs actually exist (exit codes are best-effort even with appQuitOnError)
-Assert-Path $RegistrationCSV     "Registration CSV (export may have failed)"
-Assert-Path $SparsePointCloudPLY "Sparse point cloud PLY (export may have failed)"
+# Verify the outputs exist AND were written by this run (exit codes are
+# best-effort even with appQuitOnError, and stale files must not fake success)
+Assert-FreshOutput $RegistrationCSV     "Registration CSV (export may have failed)"
+Assert-FreshOutput $SparsePointCloudPLY "Sparse point cloud PLY (export may have failed)"
 
 Write-Host "`nRealityScan finished successfully."
 Write-Host "  Registration CSV  : $RegistrationCSV"
@@ -568,8 +704,35 @@ if (Test-Path $TagMeasurementsCSV) {
 
 # -- Dense cloud validation (dense mode only) ------------------------------
 if (-not $SparseInit) {
-    if (-not (Test-AndFixDensePly $DensePointCloudPLY)) {
-        Write-Warning "Dense init cloud unusable - falling back to the sparse cloud for this run (check $DenseExportXml and the .rsinfo next to the export)."
+    $denseOk = $false
+    if ((Test-Path $DensePointCloudPLY) -and ((Get-Item $DensePointCloudPLY).LastWriteTime -ge $RunStart)) {
+        $denseOk = Test-AndFixDensePly $DensePointCloudPLY
+    } else {
+        Write-Warning "Dense cloud missing or stale - RealityScan's model export produced nothing."
+    }
+    if ($denseOk) {
+        # Frame sanity: the dense cloud must live in the same coordinate frame
+        # as the sparse cloud (both come from the same aligned component). A
+        # huge offset means the model export used a different coordinate
+        # system - do not train on it.
+        $db = Get-PlyBounds $DensePointCloudPLY
+        $sb = Get-PlyBounds $SparsePointCloudPLY
+        if ($null -ne $db -and $null -ne $sb) {
+            $dc = @(0, 1, 2 | ForEach-Object { ($db.Min[$_] + $db.Max[$_]) / 2.0 })
+            $sc = @(0, 1, 2 | ForEach-Object { ($sb.Min[$_] + $sb.Max[$_]) / 2.0 })
+            $sparseDiag = [Math]::Sqrt((0, 1, 2 | ForEach-Object { [Math]::Pow($sb.Max[$_] - $sb.Min[$_], 2) } | Measure-Object -Sum).Sum)
+            $centerDist = [Math]::Sqrt((0, 1, 2 | ForEach-Object { [Math]::Pow($dc[$_] - $sc[$_], 2) } | Measure-Object -Sum).Sum)
+            $maxAbs = (@($db.Min; $db.Max) | ForEach-Object { [Math]::Abs($_) } | Measure-Object -Maximum).Maximum
+            if ($maxAbs -gt 1e5 -or $centerDist -gt (20 * [Math]::Max($sparseDiag, 0.1))) {
+                Write-Warning ("Dense cloud frame looks inconsistent with the sparse cloud (center offset {0:f2}, max coord {1:g3}) - not training on it." -f $centerDist, $maxAbs)
+                $denseOk = $false
+            } else {
+                Write-Host ("  Dense/sparse frame check OK (center offset {0:f3} m)" -f $centerDist)
+            }
+        }
+    }
+    if (-not $denseOk) {
+        Write-Warning "Falling back to the sparse point cloud for this run's training."
         if (Test-Path $DensePointCloudPLY) { Remove-Item -Path $DensePointCloudPLY -Force }
         Copy-Item -Path $SparsePointCloudPLY -Destination (Join-Path $ImagesFolder "sparse_point_cloud.ply") -Force
     }
@@ -623,8 +786,8 @@ if ($psExit -ne 0) {
     exit $psExit
 }
 
-Assert-Path $ProjectFile "PostShot project (training may have failed)"
-Assert-Path $SplatFile   "Splat export (training may have failed)"
+Assert-FreshOutput $ProjectFile "PostShot project (training may have failed)"
+Assert-FreshOutput $SplatFile   "Splat export (training may have failed)"
 
 Write-Host "`nTraining finished."
 Write-Host "  Project : $ProjectFile"
