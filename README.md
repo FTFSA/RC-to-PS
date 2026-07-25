@@ -142,6 +142,105 @@ in none, reposition the scale bar and recapture.
 If both files are somehow missing the script warns and continues without GCPs — the
 scene will then be unscaled and uncentered.
 
+## Doing it manually in the GUI
+
+Every setting the script pins, for replicating the pipeline by hand in RealityScan and
+Postshot. Values in parentheses are the script parameter that overrides them.
+
+### RealityScan — Alignment settings
+
+| Setting | Value |
+|---|---|
+| Feature detection quality | High |
+| Max features per megapixel | 10 000 |
+| Max features per image | 80 000 |
+| Image overlap | Medium |
+| Image downscale factor | 1 |
+| Max feature reprojection error | 2.0 |
+| Use camera priors for georeferencing | **No** |
+| Control point image measurement accuracy [px] | 0.5 |
+| Control point Position X / Y / Z accuracy | 0.001 m |
+| Defined distance accuracy | 0.001 |
+| Add reconstruction region after alignment | Yes |
+| Force component rematch | No |
+| Preselector features | 10 000 |
+| Detector sensitivity | High |
+| Merge georeferenced components | No |
+| Distortion model | Brown3 |
+
+### RealityScan — Detect Markers tool
+
+| Setting | Value |
+|---|---|
+| Marker type | Square / AprilTag, family **tag36h11** |
+| Minimal measurements per marker | 2 (`-MinTagMeasurements`) |
+
+### RealityScan — Ground control points
+
+Import `gcps.csv` (coordinates in the Georeferencing section above) with:
+
+| Setting | Value |
+|---|---|
+| Point type | Ground Control Point (not tie point) |
+| Coordinate system | `local:1 - Euclidean` |
+| Position accuracy X / Y / Z | 0.001 m |
+| CSV format | `"name" X Y Z`, space-separated, no header |
+
+On the Coordinate System Change dialog choose **"Set to the Project"** (leave "Set
+output coordinate system" ticked) — never "Convert Coordinates".
+
+### RealityScan — run order
+
+1. Add the images folder
+2. Import ground control points (as above)
+3. Detect Markers (AprilTag 36h11)
+4. **Align Images** (not Update)
+5. Select the **largest component**; confirm all cameras landed in one component and
+   GCP residuals are ~1–2 mm in the alignment report
+6. Save the project (debugging safety net)
+
+### RealityScan — exports
+
+Both exports must use the same coordinate system (`local:1 - Euclidean`), transform at
+identity (Move/Rotate 0, Scale 1).
+
+| Export | Settings |
+|---|---|
+| Registration | Save as type: **Internal/External camera parameters (.csv)** → `registration.csv` in the images folder |
+| Sparse point cloud | PLY, Export ascii: **False**, Export vertex colors: **True** |
+
+### RealityScan — dense init cloud (default pipeline)
+
+1. Reconstruction in **Preview** quality (`-DenseQuality`; Normal/High for more detail)
+2. Simplify: Absolute, target **4 000 000 triangles** (`-DenseTargetTris`) — vertices
+   come out at roughly half the triangle count
+3. Colorize (calculate vertex colors — models are born uncolored)
+4. Export Model as **PLY, binary, vertex colors on, no normals/textures** →
+   `dense_point_cloud.ply` in the images folder
+
+> ⚠ RealityScan's model export writes **float** vertex colors, which Postshot silently
+> reads as an *empty* point cloud. The script converts the file to `uchar` RGB
+> automatically; if you export manually, convert it yourself (e.g. CloudCompare:
+> open → save as binary PLY with 8-bit colors) or Postshot will train from nothing.
+> Keep exactly **one** point cloud in the images folder.
+
+### Postshot
+
+Import the images folder as one drop (images + `registration.csv` + the one PLY).
+
+| Setting | Value |
+|---|---|
+| Camera Poses | Import (skips Postshot's own tracking) |
+| Image Selection | Use All Images |
+| Profile | **Splat MCMC** |
+| Recenter Poses & Points | **Unchecked** (keeps the tag-anchored frame; script passes `--no-recenter-points`) |
+| Max Splats | 3000 kSplats = Postshot default (`-MaxSplats`; MCMC always fills the budget — 1000 ≈ 225 MB is plenty for a bust) |
+| Training steps | auto (≈30 kSteps for 30 images; `-TrainSteps`) |
+| Max image size | 3840 = Postshot default (`-MaxImageSize`; smoke test uses 3200) |
+
+Then export the splat as PLY. Photometric compensation (GUI-only as of v1.1) can be
+enabled before training if needed.
+
 ## Notes
 
 - The script writes `DetectMarkersParams.xml`, `ExportRegParams.xml`, and
