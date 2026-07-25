@@ -5,23 +5,26 @@
 # Expects:  ParentFolder\
 #               <images-subfolder>\   <-- any single subfolder containing your images
 #
-# Optional inputs (in the parent folder) to center the scene on the AprilTags:
+# Inputs auto-provisioned into the parent folder (bundled in the repo) so
+# RealityScan can center/orient/scale the scene on the AprilTags:
 #   gcps.csv                -- measured tag coordinates in meters, no header.
-#                              If missing, the script copies the bundled
-#                              tag36h11 scale-bar template from the repo:
+#                              Bundled tag36h11 scale-bar template:
 #                                "36h11:011" 0.1500000000000000 0.1000000000000000 0.0000000000000000
 #                                "36h11:00e" 0.0000000000000000 0.0000000000000000 0.0000000000000000
 #                                "36h11:00f" 0.0000000000000000 0.1000000000000000 0.0000000000000000
 #   ImportGcpParams.xml     -- GCP import settings (format 'Point X/Lon Y/Lat
 #                              Z/Alt', coordinate system 'local:1 - Euclidean',
-#                              1 mm position accuracy). Bundled in the repo and
-#                              copied into the parent folder automatically.
+#                              1 mm position accuracy).
 #
-# Outputs (written into the images subfolder):
+# Outputs (written into the images subfolder, which PostShot imports whole):
 #   registration.csv        -- Internal/External camera parameters
 #   sparse_point_cloud.ply  -- sparse point cloud (binary, vertex colors)
 #
 # Outputs (written into the parent folder):
+#   tag_measurements[_smoketest].csv -- AprilTag image measurements (QC artifact)
+#   <capture>.rsproj        -- RealityScan project saved after alignment (debugging)
+#   rs_progress.log         -- RealityScan progress feed (liveness monitoring)
+#   rs_crash_reports\       -- RealityScan crash reports, if any
 #   <capture>.psht          -- trained PostShot project (opened in GUI at end)
 #   <capture>-splat.ply     -- exported splat model
 
@@ -35,12 +38,39 @@ param(
     [Parameter(Mandatory = $false, HelpMessage = "Overwrite ParentFolder\gcps.csv with the bundled tag36h11 scale-bar coordinates before running.")]
     [switch]$OverwriteGcps,
 
-    [Parameter(Mandatory = $false, HelpMessage = "Enable a fast smoke-test run (copies a subset of images into a *_smoketest folder).")]
+    [Parameter(Mandatory = $false, HelpMessage = "Run RealityScan headless (no GUI) with online communication disabled.")]
+    [switch]$HeadlessRs,
+
+    [Parameter(Mandatory = $false, HelpMessage = "Kill RealityScan if it runs longer than this many minutes. 0 = wait indefinitely.")]
+    [ValidateRange(0, 10080)]
+    [int]$RsTimeoutMinutes = 0,
+
+    [Parameter(Mandatory = $false, HelpMessage = "Abort before training when fewer than this percentage of images registered. 0 = disable the gate.")]
+    [ValidateRange(0, 100)]
+    [int]$MinRegisteredPct = 80,
+
+    [Parameter(Mandatory = $false, HelpMessage = "PostShot training step limit in kSteps for full runs. 0 = let PostShot auto-compute.")]
+    [ValidateRange(0, 100000)]
+    [int]$TrainSteps = 0,
+
+    [Parameter(Mandatory = $false, HelpMessage = "PostShot max splats in kSplats for full runs. 0 = PostShot default (3000).")]
+    [ValidateRange(0, 100000)]
+    [int]$MaxSplats = 0,
+
+    [Parameter(Mandatory = $false, HelpMessage = "PostShot max image size (longer edge, px) for full runs. -1 = PostShot default (3840), 0 = no limit.")]
+    [ValidateRange(-1, 20000)]
+    [int]$MaxImageSize = -1,
+
+    [Parameter(Mandatory = $false, HelpMessage = "GPU index for PostShot training. -1 = PostShot default.")]
+    [ValidateRange(-1, 255)]
+    [int]$Gpu = -1,
+
+    [Parameter(Mandatory = $false, HelpMessage = "Enable a fast smoke-test run (links a subset of images into a *_smoketest folder).")]
     [switch]$SmokeTest,
 
-    [Parameter(Mandatory = $false, HelpMessage = "How many images to copy for smoke-test mode.")]
+    [Parameter(Mandatory = $false, HelpMessage = "How many images to use for smoke-test mode.")]
     [ValidateRange(1, 1000)]
-    [int]$SmokeTestImageCount = 8,
+    [int]$SmokeTestImageCount = 35,
 
     [Parameter(Mandatory = $false, HelpMessage = "PostShot training step limit (kSteps) for smoke-test mode.")]
     [ValidateRange(1, 1000)]
@@ -52,231 +82,27 @@ param(
 
     [Parameter(Mandatory = $false, HelpMessage = "PostShot max image size for smoke-test mode.")]
     [ValidateRange(0, 20000)]
-    [int]$SmokeTestMaxImageSize = 1600
+    [int]$SmokeTestMaxImageSize = 3200,
+
+    [Parameter(Mandatory = $false, HelpMessage = "Path to RealityScan.exe")]
+    [string]$RealityScanExe = "C:\Program Files\Epic Games\RealityScan_2.2\RealityScan.exe",
+
+    [Parameter(Mandatory = $false, HelpMessage = "Path to postshot.exe (GUI)")]
+    [string]$PostShotExe = "C:\Program Files\Jawset Postshot\bin\postshot.exe",
+
+    [Parameter(Mandatory = $false, HelpMessage = "Path to postshot-cli.exe (CLI training requires the PostShot Studio plan)")]
+    [string]$PostShotCli = "C:\Program Files\Jawset Postshot\bin\postshot-cli.exe"
 )
 
-# -- Adjust these paths to match your installations --------------------
-$RealityScanExe = "C:\Program Files\Epic Games\RealityScan_2.2\RealityScan.exe"
-$PostShotExe    = "C:\Program Files\Jawset Postshot\bin\postshot.exe"
-$PostShotCli    = "C:\Program Files\Jawset Postshot\bin\postshot-cli.exe"
-# ----------------------------------------------------------------------
-
 Set-StrictMode -Version Latest
+
+$SupportedImageExts = @(".jpg", ".jpeg", ".png", ".tif", ".tiff", ".bmp", ".exr")
 
 function Assert-Path([string]$path, [string]$label) {
     if (-not (Test-Path $path)) {
         Write-Error "$label not found: $path"
         exit 1
     }
-}
-
-$Inv = [System.Globalization.CultureInfo]::InvariantCulture
-
-function Get-JpegDimensions([string]$Path) {
-    # Minimal JPEG SOF parser: returns @(width, height) or $null
-    $fs = [System.IO.File]::OpenRead($Path)
-    try {
-        $b = New-Object byte[] 2
-        if ($fs.Read($b, 0, 2) -ne 2 -or $b[0] -ne 0xFF -or $b[1] -ne 0xD8) { return $null }
-        while ($true) {
-            $m = $fs.ReadByte()
-            if ($m -lt 0) { return $null }
-            if ($m -ne 0xFF) { continue }
-            $code = $fs.ReadByte()
-            while ($code -eq 0xFF) { $code = $fs.ReadByte() }
-            if ($code -lt 0) { return $null }
-            if ($code -ge 0xD0 -and $code -le 0xD9) { continue }
-            if ($fs.Read($b, 0, 2) -ne 2) { return $null }
-            $len = $b[0] * 256 + $b[1]
-            $isSOF = ($code -ge 0xC0 -and $code -le 0xCF -and $code -ne 0xC4 -and $code -ne 0xC8 -and $code -ne 0xCC)
-            if ($isSOF) {
-                $seg = New-Object byte[] 5
-                if ($fs.Read($seg, 0, 5) -ne 5) { return $null }
-                return @(($seg[3] * 256 + $seg[4]), ($seg[1] * 256 + $seg[2]))
-            }
-            [void]$fs.Seek($len - 2, 'Current')
-        }
-    } finally { $fs.Close() }
-}
-
-function Get-RcRotationMatrix([double]$YawDeg, [double]$PitchDeg, [double]$RollDeg) {
-    # RealityScan camera rotation from yaw/pitch/roll (per Epic dev community)
-    $d = [Math]::PI / 180.0
-    $cx = [Math]::Cos($RollDeg * $d);  $sx = [Math]::Sin($RollDeg * $d)
-    $cy = [Math]::Cos($PitchDeg * $d); $sy = [Math]::Sin($PitchDeg * $d)
-    $cz = [Math]::Cos($YawDeg * $d);   $sz = [Math]::Sin($YawDeg * $d)
-    return @(
-        ($cx*$cz + $sx*$sy*$sz), (-$cx*$sz + $cz*$sx*$sy), (-$cy*$sx),
-        (-$cy*$sz),              (-$cy*$cz),               (-$sy),
-        ($cx*$sy*$sz - $cz*$sx), ($cx*$cz*$sy + $sx*$sz),  (-$cx*$cy)
-    )
-}
-
-function Invoke-TagTriangulation($Obs, [int]$RotMode, [int]$VFlip) {
-    # Least-squares intersection of the observation rays (lines), plus residual
-    $A  = New-Object 'double[]' 9
-    $bv = New-Object 'double[]' 3
-    $dirs = @(); $cams = @()
-    foreach ($o in $Obs) {
-        $R   = $o.R
-        $fpx = $o.F35 * $o.W / 36.0
-        $cxp = $o.W / 2.0 + $o.PxN * $o.W
-        $cyp = $o.H / 2.0 + $o.PyN * $o.W
-        $u = ($o.U - $cxp) / $fpx
-        $v = ($o.V - $cyp) / $fpx
-        if ($VFlip -eq 1) { $v = -$v }
-        $dc = @($u, $v, 1.0)
-        # NOTE: every element must be parenthesized - PowerShell's comma
-        # operator binds tighter than arithmetic operators.
-        if ($RotMode -eq 0) {
-            $dw = @(
-                ($R[0]*$dc[0] + $R[1]*$dc[1] + $R[2]*$dc[2]),
-                ($R[3]*$dc[0] + $R[4]*$dc[1] + $R[5]*$dc[2]),
-                ($R[6]*$dc[0] + $R[7]*$dc[1] + $R[8]*$dc[2])
-            )
-        } else {
-            $dw = @(
-                ($R[0]*$dc[0] + $R[3]*$dc[1] + $R[6]*$dc[2]),
-                ($R[1]*$dc[0] + $R[4]*$dc[1] + $R[7]*$dc[2]),
-                ($R[2]*$dc[0] + $R[5]*$dc[1] + $R[8]*$dc[2])
-            )
-        }
-        $n = [Math]::Sqrt($dw[0]*$dw[0] + $dw[1]*$dw[1] + $dw[2]*$dw[2])
-        $dw = @(($dw[0]/$n), ($dw[1]/$n), ($dw[2]/$n))
-        $dirs += ,$dw
-        $cams += ,$o.C
-        for ($r = 0; $r -lt 3; $r++) {
-            for ($c = 0; $c -lt 3; $c++) {
-                $mij = -$dw[$r] * $dw[$c]
-                if ($r -eq $c) { $mij = 1.0 + $mij }
-                $A[$r*3+$c] += $mij
-                $bv[$r] += $mij * $o.C[$c]
-            }
-        }
-    }
-    $det = $A[0]*($A[4]*$A[8]-$A[5]*$A[7]) - $A[1]*($A[3]*$A[8]-$A[5]*$A[6]) + $A[2]*($A[3]*$A[7]-$A[4]*$A[6])
-    if ([Math]::Abs($det) -lt 1e-12) { return $null }
-    $d0 = $bv[0]*($A[4]*$A[8]-$A[5]*$A[7]) - $A[1]*($bv[1]*$A[8]-$A[5]*$bv[2]) + $A[2]*($bv[1]*$A[7]-$A[4]*$bv[2])
-    $d1 = $A[0]*($bv[1]*$A[8]-$A[5]*$bv[2]) - $bv[0]*($A[3]*$A[8]-$A[5]*$A[6]) + $A[2]*($A[3]*$bv[2]-$bv[1]*$A[6])
-    $d2 = $A[0]*($A[4]*$bv[2]-$bv[1]*$A[7]) - $A[1]*($A[3]*$bv[2]-$bv[1]*$A[6]) + $bv[0]*($A[3]*$A[7]-$A[4]*$A[6])
-    $P = @(($d0/$det), ($d1/$det), ($d2/$det))
-    $sumSq = 0.0; $dists = @()
-    for ($i = 0; $i -lt $dirs.Count; $i++) {
-        $w = @(($P[0]-$cams[$i][0]), ($P[1]-$cams[$i][1]), ($P[2]-$cams[$i][2]))
-        $t = $w[0]*$dirs[$i][0] + $w[1]*$dirs[$i][1] + $w[2]*$dirs[$i][2]
-        $px = $w[0] - $t*$dirs[$i][0]; $py = $w[1] - $t*$dirs[$i][1]; $pz = $w[2] - $t*$dirs[$i][2]
-        $sumSq += $px*$px + $py*$py + $pz*$pz
-        $dists += [Math]::Sqrt($w[0]*$w[0] + $w[1]*$w[1] + $w[2]*$w[2])
-    }
-    $rms = [Math]::Sqrt($sumSq / $dirs.Count)
-    $sorted = $dists | Sort-Object
-    $median = $sorted[[int](($sorted.Count - 1) / 2)]
-    return @{ P = $P; Rms = $rms; MedianDist = $median }
-}
-
-function Center-SceneOnTag([string]$RegCsv, [string]$PlyFile, [string]$CpmCsv, [string]$ImgFolder) {
-    # Triangulates the most-observed AprilTag and translates the exported
-    # registration CSV + sparse PLY so the tag becomes the scene origin.
-    $inv = [System.Globalization.CultureInfo]::InvariantCulture
-
-    $meas = @()
-    foreach ($line in (Get-Content $CpmCsv)) {
-        $f = $line.Split(',')
-        if ($f.Count -ge 4) {
-            $meas += ,@{ File = [System.IO.Path]::GetFileName($f[0].Trim()); Tag = $f[1].Trim();
-                         U = [double]::Parse($f[2].Trim(), $inv); V = [double]::Parse($f[3].Trim(), $inv) }
-        }
-    }
-    if ($meas.Count -eq 0) { Write-Warning "No tag measurements found - skipping centering."; return $false }
-
-    $best = $meas | Group-Object { $_.Tag } | Sort-Object Count -Descending | Select-Object -First 1
-    if ($best.Count -lt 2) { Write-Warning "Tag '$($best.Name)' seen in fewer than 2 images - cannot triangulate."; return $false }
-    Write-Host "Centering scene on tag '$($best.Name)' ($($best.Count) observations)"
-
-    $cameras = @{}
-    foreach ($line in (Get-Content $RegCsv)) {
-        if ($line.StartsWith("#") -or [string]::IsNullOrWhiteSpace($line)) { continue }
-        $f = $line.Split(',')
-        $cameras[$f[0].Trim()] = @{
-            C   = @([double]::Parse($f[1], $inv), [double]::Parse($f[2], $inv), [double]::Parse($f[3], $inv))
-            R   = Get-RcRotationMatrix ([double]::Parse($f[4], $inv)) ([double]::Parse($f[5], $inv)) ([double]::Parse($f[6], $inv))
-            F35 = [double]::Parse($f[7], $inv)
-            PxN = [double]::Parse($f[8], $inv)
-            PyN = [double]::Parse($f[9], $inv)
-        }
-    }
-
-    $dims = @{}
-    $obs = @()
-    foreach ($m in ($best.Group)) {
-        if (-not $cameras.ContainsKey($m.File)) { continue }
-        if (-not $dims.ContainsKey($m.File)) { $dims[$m.File] = Get-JpegDimensions (Join-Path $ImgFolder $m.File) }
-        $wh = $dims[$m.File]
-        if ($null -eq $wh) { continue }
-        $cam = $cameras[$m.File]
-        $obs += ,@{ C = $cam.C; R = $cam.R; F35 = $cam.F35; PxN = $cam.PxN; PyN = $cam.PyN;
-                    U = $m.U; V = $m.V; W = [double]$wh[0]; H = [double]$wh[1] }
-    }
-    if ($obs.Count -lt 2) { Write-Warning "Not enough usable observations - skipping centering."; return $false }
-
-    # RealityScan's exact projection conventions are undocumented; try both
-    # rotation directions and image-V orientations, keep the best fit.
-    $bestSol = $null
-    foreach ($rot in 0, 1) {
-        foreach ($vf in 0, 1) {
-            $sol = Invoke-TagTriangulation $obs $rot $vf
-            if ($null -ne $sol) {
-                if ($null -eq $bestSol -or $sol.Rms -lt $bestSol.Rms) { $bestSol = $sol }
-            }
-        }
-    }
-    if ($null -eq $bestSol) { Write-Warning "Triangulation failed - skipping centering."; return $false }
-
-    $rel = $bestSol.Rms / $bestSol.MedianDist
-    Write-Host ("Tag position: [{0:f4}, {1:f4}, {2:f4}]  ray RMS: {3:f5} ({4:p2} of camera distance)" -f `
-        $bestSol.P[0], $bestSol.P[1], $bestSol.P[2], $bestSol.Rms, $rel)
-    if ([double]::IsNaN($rel) -or [double]::IsInfinity($rel) -or $rel -gt 0.02) {
-        Write-Warning "Triangulation uncertainty too high - leaving exports uncentered."
-        return $false
-    }
-    $P = $bestSol.P
-
-    # Prepare translated registration CSV (in memory)
-    $out = foreach ($line in (Get-Content $RegCsv)) {
-        if ($line.StartsWith("#") -or [string]::IsNullOrWhiteSpace($line)) { $line; continue }
-        $f = $line.Split(',')
-        for ($k = 0; $k -lt 3; $k++) {
-            $f[1 + $k] = ([double]::Parse($f[1 + $k], $inv) - $P[$k]).ToString('R', $inv)
-        }
-        $f -join ','
-    }
-
-    # Prepare translated binary PLY (in memory)
-    $bytes = [System.IO.File]::ReadAllBytes($PlyFile)
-    $headLen = [Math]::Min(4096, $bytes.Length)
-    $head = [System.Text.Encoding]::ASCII.GetString($bytes, 0, $headLen)
-    $endTok = "end_header`n"
-    $endIdx = $head.IndexOf($endTok)
-    if ($endIdx -lt 0 -or $head -notmatch "format binary_little_endian" -or $head -notmatch "element vertex (\d+)") {
-        Write-Warning "Unexpected PLY layout - exports left uncentered."
-        return $false
-    }
-    $count = [int]$Matches[1]
-    $off = $endIdx + $endTok.Length
-    for ($i = 0; $i -lt $count; $i++) {
-        $rec = $off + $i * 15
-        for ($k = 0; $k -lt 3; $k++) {
-            $val = [BitConverter]::ToSingle($bytes, $rec + 4 * $k) - $P[$k]
-            [Array]::Copy([BitConverter]::GetBytes([float]$val), 0, $bytes, $rec + 4 * $k, 4)
-        }
-    }
-
-    # Write both files only after all math succeeded
-    [System.IO.File]::WriteAllBytes($PlyFile, $bytes)
-    Set-Content -Path $RegCsv -Value $out -Encoding ASCII
-
-    Write-Host "Scene centered on tag '$($best.Name)' (translation only)."
-    return $true
 }
 
 # -- Validate inputs ---------------------------------------------------
@@ -290,7 +116,8 @@ if ($ImagesFolder) {
     Assert-Path $ImagesFolder "Images folder (override)"
     $ImagesFolder = (Resolve-Path $ImagesFolder).Path
 } else {
-    $subfolders = @(Get-ChildItem -Path $ParentFolder -Directory)
+    # Ignore *_smoketest folders left behind by earlier smoke runs
+    $subfolders = @(Get-ChildItem -Path $ParentFolder -Directory | Where-Object { $_.Name -notlike "*_smoketest" })
 
     if ($subfolders.Count -eq 0) {
         Write-Error "No subfolders found inside: $ParentFolder"
@@ -304,11 +131,11 @@ if ($ImagesFolder) {
     $ImagesFolder = $subfolders[0].FullName
 }
 Write-Host "Images folder : $ImagesFolder"
+
 # -- Optional smoke-test subset -----------------------------------------
 if ($SmokeTest) {
     $sourceFolder = $ImagesFolder
-    $supported = @(".jpg", ".jpeg", ".png", ".tif", ".tiff", ".bmp")
-    $allImages = @(Get-ChildItem -Path $sourceFolder -File | Where-Object { $supported -contains $_.Extension.ToLowerInvariant() } | Sort-Object Name)
+    $allImages = @(Get-ChildItem -Path $sourceFolder -File | Where-Object { $SupportedImageExts -contains $_.Extension.ToLowerInvariant() } | Sort-Object Name)
     if ($allImages.Count -eq 0) {
         Write-Error "Smoke test mode found no supported image files in: $sourceFolder"
         exit 1
@@ -325,8 +152,15 @@ if ($SmokeTest) {
     }
     [void](New-Item -ItemType Directory -Path $smokeFolder)
 
+    # Hardlink instead of copy (same volume, instant, no extra disk); fall back
+    # to a real copy if linking fails (e.g. unsupported filesystem).
     foreach ($img in ($allImages | Select-Object -First $useCount)) {
-        Copy-Item -Path $img.FullName -Destination (Join-Path $smokeFolder $img.Name)
+        $dest = Join-Path $smokeFolder $img.Name
+        try {
+            [void](New-Item -ItemType HardLink -Path $dest -Target $img.FullName -ErrorAction Stop)
+        } catch {
+            Copy-Item -Path $img.FullName -Destination $dest
+        }
     }
     $ImagesFolder = $smokeFolder
     Write-Host "Smoke test mode enabled."
@@ -335,10 +169,19 @@ if ($SmokeTest) {
     Write-Host "  Image count   : $useCount"
 }
 
-# -- Define output paths (same folder as images) -----------------------
+# -- Names and output paths ---------------------------------------------
+# Only registration.csv + sparse_point_cloud.ply may live in the images folder:
+# PostShot imports that folder as one dataset and allows exactly one pose CSV
+# and one point cloud in it. Everything else goes to the parent folder.
+$CaptureName         = Split-Path $ImagesFolder -Leaf
 $RegistrationCSV     = Join-Path $ImagesFolder "registration.csv"
 $SparsePointCloudPLY = Join-Path $ImagesFolder "sparse_point_cloud.ply"
-$TagMeasurementsCSV  = if ($SmokeTest) { Join-Path $ImagesFolder "tag_measurements.csv" } else { Join-Path $ParentFolder "tag_measurements.csv" }
+$TagMeasurementsCSV  = if ($SmokeTest) { Join-Path $ParentFolder "tag_measurements_smoketest.csv" } else { Join-Path $ParentFolder "tag_measurements.csv" }
+$RsProjFile          = Join-Path $ParentFolder ($CaptureName + ".rsproj")
+$RsProgressLog       = Join-Path $ParentFolder "rs_progress.log"
+$RsCrashDir          = Join-Path $ParentFolder "rs_crash_reports"
+$ProjectFile         = Join-Path $ParentFolder ($CaptureName + ".psht")
+$SplatFile           = Join-Path $ParentFolder ($CaptureName + "-splat.ply")
 
 # -- Write settings files (kept in the parent folder) ------------------
 # Marker detection: AprilTag 36h11
@@ -458,10 +301,25 @@ $PlyParamsXml = Join-Path $ParentFolder "ExportPlyParams.xml"
 # -- Run RealityScan via CLI -------------------------------------------
 Write-Host "`nLaunching RealityScan (align + export)..."
 
+[void](New-Item -ItemType Directory -Force -Path $RsCrashDir)
+if (Test-Path $RsProgressLog) { Remove-Item -Path $RsProgressLog -Force }
+
 # Note: Start-Process does not quote arguments itself, so wrap every path in
 # explicit quotes to support folders with spaces (e.g. "Chris Berry").
-$rcArgs = @(
+$rcArgs = @()
+if ($HeadlessRs) {
+    $rcArgs += @("-headless", "-disableOnlineCommunication")
+}
+$rcArgs += @(
+    # Suppress warning dialogs and crash-report uploads (reports are written to
+    # the folder instead), and stream progress to a file for liveness checks.
+    "-silent",        "`"$RsCrashDir`""
+    "-writeProgress", "`"$RsProgressLog`""
     "-newScene"
+    # Without appQuitOnError, RealityScan continues past failed commands and
+    # can exit 0 despite errors; with it, the exit code is the real error code.
+    "-set", "`"appQuitOnError=true`""
+    "-set", "`"suppressErrors=true`""
 )
 
 # Alignment settings (per realityscan-postshot-settings reference doc). Pinned
@@ -499,20 +357,22 @@ $rcArgs += @(
 
 # Ground control points: center/orient/scale the scene on the AprilTags.
 # Requires at least 3 tags with measured coordinates in gcps.csv.
-$UsedGcp = $false
 if ((Test-Path $GcpCsv) -and (Test-Path $GcpParamsXml)) {
     Write-Host "Using ground control points: $GcpCsv"
     $rcArgs += @("-importGroundControlPoints", "`"$GcpCsv`"", "`"$GcpParamsXml`"")
-    $UsedGcp = $true
-} elseif (Test-Path $GcpCsv) {
-    Write-Warning "gcps.csv found but ImportGcpParams.xml is missing - save it once from RealityScan's Import Ground Control Points dialog (see script header). Falling back to triangulation centering."
 } else {
-    Write-Host "No gcps.csv - will center on the best-observed tag by triangulation instead."
+    Write-Warning "gcps.csv or ImportGcpParams.xml missing - skipping GCP import; the scene will be UNSCALED and UNCENTERED. Restore the bundled repo files to georeference."
 }
 
 $rcArgs += @(
     "-detectMarkers",          "`"$DetectMarkersXml`""
     "-align"
+    # Exports operate on the *selected* component; make sure that's the largest
+    # one in case alignment split the images into multiple components.
+    "-selectMaximalComponent"
+    # Keep the aligned project around so failed or odd runs can be opened in
+    # the GUI for post-mortems.
+    "-save",                   "`"$RsProjFile`""
     "-exportControlPointsMeasurements", "`"$TagMeasurementsCSV`""
     "-exportRegistration",     "`"$RegistrationCSV`"",     "`"$RegParamsXml`""
     "-exportSparsePointCloud", "`"$SparsePointCloudPLY`"", "`"$PlyParamsXml`""
@@ -522,71 +382,77 @@ $rcArgs += @(
 Write-Host "Command: $RealityScanExe $rcArgs`n"
 
 # Run and wait for RealityScan to finish before continuing
-$rcProc = Start-Process -FilePath $RealityScanExe -ArgumentList $rcArgs -PassThru -Wait
+$rcProc = Start-Process -FilePath $RealityScanExe -ArgumentList $rcArgs -PassThru
+$null = $rcProc.Handle  # cache the handle so .ExitCode is readable after exit
+if ($RsTimeoutMinutes -gt 0) {
+    if (-not $rcProc.WaitForExit($RsTimeoutMinutes * 60000)) {
+        $rcProc.Kill()
+        Write-Error "RealityScan did not finish within $RsTimeoutMinutes minutes - killed. Check $RsProgressLog for the last activity."
+        exit 1
+    }
+} else {
+    $rcProc.WaitForExit()
+}
 $rcExit = $rcProc.ExitCode
 
 if ($rcExit -ne 0) {
-    Write-Error "RealityScan exited with code $rcExit - check the RealityScan log for details."
+    Write-Error "RealityScan exited with code $rcExit - check $RsProgressLog and $RsCrashDir, or open $RsProjFile in the GUI."
     exit $rcExit
 }
 
-# Verify the outputs actually exist
+# Verify the outputs actually exist (exit codes are best-effort even with appQuitOnError)
 Assert-Path $RegistrationCSV     "Registration CSV (export may have failed)"
 Assert-Path $SparsePointCloudPLY "Sparse point cloud PLY (export may have failed)"
 
 Write-Host "`nRealityScan finished successfully."
 Write-Host "  Registration CSV  : $RegistrationCSV"
 Write-Host "  Sparse point cloud: $SparsePointCloudPLY"
+Write-Host "  Project           : $RsProjFile"
 
-# -- Center scene on tag (when GCPs were not used) ----------------------
-if (-not $UsedGcp) {
-    if (Test-Path $TagMeasurementsCSV) {
-        try {
-            $ErrorActionPreference = 'Stop'
-            [void](Center-SceneOnTag $RegistrationCSV $SparsePointCloudPLY $TagMeasurementsCSV $ImagesFolder)
-        } catch {
-            Write-Warning "Centering failed ($($_.Exception.Message)) - exports left uncentered."
-        } finally {
-            $ErrorActionPreference = 'Continue'
-        }
-    } else {
-        Write-Warning "No tag measurements were exported - scene left uncentered."
+# -- Alignment quality gate ----------------------------------------------
+# Cheap sanity check before spending GPU time: how many of the input images
+# actually ended up registered in the exported (maximal) component?
+$imageCount      = @(Get-ChildItem -Path $ImagesFolder -File | Where-Object { $SupportedImageExts -contains $_.Extension.ToLowerInvariant() }).Count
+$registeredCount = @(Get-Content $RegistrationCSV | Where-Object { $_ -and -not $_.StartsWith("#") }).Count
+if ($imageCount -gt 0) {
+    $registeredPct = [Math]::Round(100.0 * $registeredCount / $imageCount, 1)
+    Write-Host "  Registered images : $registeredCount of $imageCount ($registeredPct%)"
+    if ($MinRegisteredPct -gt 0 -and $registeredPct -lt $MinRegisteredPct) {
+        Write-Error "Only $registeredPct% of images registered (threshold $MinRegisteredPct%) - aborting before training. Inspect $RsProjFile in RealityScan, or rerun with -MinRegisteredPct 0 to override."
+        exit 1
     }
+} else {
+    Write-Warning "No supported image files counted in $ImagesFolder - skipping the registration gate."
 }
 
 # -- Train in PostShot via postshot-cli ----------------------------------
-# PostShot imports the RealityScan poses (registration.csv) + point cloud
-# (sparse_point_cloud.ply) alongside the images, so it skips its own camera
-# tracking and trains on RealityScan's coordinate frame. No AprilTag work is
-# needed in PostShot - the RealityScan export already carries origin,
-# orientation, and metric scale.
-$CaptureName = Split-Path $ImagesFolder -Leaf
-$ProjectOutDir = if ($SmokeTest) { $ImagesFolder } else { $ParentFolder }
-$ProjectFile = Join-Path $ProjectOutDir ($CaptureName + ".psht")
-$SplatFile   = Join-Path $ProjectOutDir ($CaptureName + "-splat.ply")
+# PostShot imports the images folder as one dataset: images + registration.csv
+# (poses) + sparse_point_cloud.ply (seed points). With imported poses it skips
+# its own camera tracking and trains on RealityScan's coordinate frame, which
+# already carries origin, orientation, and metric scale from the GCPs. Folder
+# import also avoids the ~32k char Windows command-line limit that per-file
+# arguments would hit on large captures.
+$importFolder = $ImagesFolder.TrimEnd('\', '/')  # trailing backslash breaks postshot-cli paths
 
-$supportedImportImages = @(".jpg", ".jpeg", ".png", ".tif", ".tiff", ".bmp", ".exr")
-$importImages = @(Get-ChildItem -Path $ImagesFolder -File | Where-Object { $supportedImportImages -contains $_.Extension.ToLowerInvariant() } | Sort-Object Name | ForEach-Object { $_.FullName })
-$importFiles = @()
-$importFiles += $importImages
-$importFiles += $RegistrationCSV
-$importFiles += $SparsePointCloudPLY
+Write-Host "`nStarting PostShot training - this can take a while..."
 
-Write-Host "`nStarting PostShot training ($($importFiles.Count) inputs) - this can take a while..."
-
-$psArgs = @("train", "-i")
-$psArgs += $importFiles
-$psArgs += @("--profile", "Splat MCMC")
+# Profile pinned: PostShot's default changed to Splat3 in v1.1.
+$psArgs = @("train", "-i", $importFolder, "--profile", "Splat MCMC")
 if ($SmokeTest) {
     $psArgs += @("-s", $SmokeTestTrainSteps.ToString(), "--max-num-splats", $SmokeTestMaxSplats.ToString(), "--max-image-size", $SmokeTestMaxImageSize.ToString())
+} else {
+    if ($TrainSteps -gt 0)   { $psArgs += @("-s", $TrainSteps.ToString()) }
+    if ($MaxSplats -gt 0)    { $psArgs += @("--max-num-splats", $MaxSplats.ToString()) }
+    if ($MaxImageSize -ge 0) { $psArgs += @("--max-image-size", $MaxImageSize.ToString()) }
 }
+if ($Gpu -ge 0) { $psArgs += @("--gpu", $Gpu.ToString()) }
 $psArgs += @("-o", $ProjectFile, "--export-splat", $SplatFile)
 
 & $PostShotCli @psArgs
 $psExit = $LASTEXITCODE
 
 if ($psExit -ne 0) {
-    Write-Error "postshot-cli exited with code $psExit."
+    Write-Error "postshot-cli exited with code $psExit - see $env:LOCALAPPDATA\Postshot\Postshot.log for details."
     exit $psExit
 }
 
