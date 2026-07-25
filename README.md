@@ -6,12 +6,14 @@ One PowerShell script that:
 
 1. Runs **RealityScan** headlessly via CLI: imports an image folder, imports AprilTag
    ground control points, detects AprilTag (36h11) markers, aligns cameras, selects the
-   largest component, saves the project, and exports camera registration + a sparse
-   point cloud — all georeferenced (origin, orientation, metric scale) to the tags.
-2. Sanity-checks the alignment (percentage of images registered) before spending GPU time.
+   largest component, saves the project, exports camera registration, and builds a
+   **dense, vertex-colored init cloud** (preview-quality mesh → simplify → colorize →
+   export vertices) — all georeferenced (origin, orientation, metric scale) to the tags.
+2. Sanity-checks the run (registered-image percentage, tag coverage, init-cloud
+   validity) before spending GPU time.
 3. Runs **Postshot** via `postshot-cli`: imports the images folder (poses + point cloud
-   included) and trains a Gaussian splat (Splat MCMC profile) — no camera tracking or
-   AprilTag work needed in Postshot.
+   included) and trains a Gaussian splat (Splat MCMC profile) with recentering disabled,
+   so the tag-anchored coordinate frame survives into the splat.
 4. Exports a `.psht` project + splat `.ply`, and opens the result in the Postshot GUI.
 
 ## Prerequisites
@@ -34,7 +36,8 @@ ParentFolder\
     ImportGcpParams.xml     <- auto-copied from this repo if missing
 ```
 
-The capture should include the AprilTag 36h11 scale bar visible in multiple images.
+The capture must include the AprilTag 36h11 scale bar, with **all three tags visible to
+several cameras** (see Georeferencing below).
 
 ## Usage
 
@@ -66,6 +69,10 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\rc_to_postshot.ps1 `
 | `-ParentFolder` | (required) | Folder containing the images subfolder; settings XMLs and outputs go here |
 | `-ImagesFolder` | auto-detect | Path to the images folder directly |
 | `-OverwriteGcps` | off | Overwrite `ParentFolder\gcps.csv` + `ImportGcpParams.xml` with the bundled templates |
+| `-SparseInit` | off | Initialize Postshot from the sparse tie-point cloud instead of the dense cloud (A/B testing) |
+| `-DenseTargetTris` | 4000000 | Simplify target (triangles) for the dense model; points ≈ half of this |
+| `-DenseQuality` | Preview | Reconstruction quality for the dense cloud: Preview (CPU, fastest), Normal, High |
+| `-MinTagMeasurements` | 2 | Min images a tag must appear in to become a control point (try 1 to rescue a tag seen once) |
 | `-HeadlessRs` | off | Run RealityScan with `-headless` (no GUI) and online communication disabled |
 | `-RsTimeoutMinutes` | 0 (no limit) | Kill RealityScan if it runs longer than this (guards against stuck dialogs) |
 | `-MinRegisteredPct` | 80 | Abort before training if fewer % of images registered (0 = disable gate) |
@@ -83,7 +90,10 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\rc_to_postshot.ps1 `
 ## Outputs
 
 - `<images-subfolder>\registration.csv` — camera poses (tag-referenced)
-- `<images-subfolder>\sparse_point_cloud.ply` — sparse point cloud (tag-referenced)
+- `<images-subfolder>\dense_point_cloud.ply` — dense init cloud (binary, vertex colors);
+  with `-SparseInit`, `sparse_point_cloud.ply` sits here instead
+- `ParentFolder\sparse_point_cloud.ply` — sparse tie points (QC + automatic fallback if
+  the dense export ever fails; dense mode only)
 - `ParentFolder\tag_measurements.csv` — AprilTag image measurements (QC artifact)
 - `ParentFolder\<capture>.rsproj` — RealityScan project saved after alignment (open in
   the GUI to debug a bad run)
@@ -93,10 +103,9 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\rc_to_postshot.ps1 `
 - `ParentFolder\<capture>-splat.ply` — exported splat model
 
 Smoke test: same layout, with the capture name suffixed `_smoketest` (e.g.
-`MyCapture_smoketest.psht`) and measurements in `tag_measurements_smoketest.csv`. Only
-`registration.csv` + `sparse_point_cloud.ply` live in the images folder — Postshot
-imports that folder as a single dataset and expects exactly one pose CSV and one point
-cloud in it.
+`MyCapture_smoketest.psht`) and measurements in `tag_measurements_smoketest.csv`. The
+images folder holds exactly one pose CSV and one point cloud — Postshot imports that
+folder as a single dataset and requires it.
 
 ## Georeferencing
 
@@ -122,13 +131,21 @@ ground control points:
   repo and copied into the parent folder automatically** (also refreshed by
   `-OverwriteGcps`).
 
+**All three tags must be measured in at least 2 images each.** With only two usable
+tags, RealityScan can fix the origin and scale but the rotation around the axis through
+those two tags is unconstrained — the tag plane can tilt away from Z = 0. The script
+prints per-tag sighting counts after alignment and warns when coverage is short. If a
+tag was seen in exactly one image, `-MinTagMeasurements 1` may rescue it; if it was seen
+in none, reposition the scale bar and recapture.
+
 If both files are somehow missing the script warns and continues without GCPs — the
 scene will then be unscaled and uncentered.
 
 ## Notes
 
-- The script writes `DetectMarkersParams.xml`, `ExportRegParams.xml`, and
-  `ExportPlyParams.xml` into the parent folder on every run (no manual setup needed).
+- The script writes `DetectMarkersParams.xml`, `ExportRegParams.xml`,
+  `ExportPlyParams.xml`, and `DenseExportParams.xml` into the parent folder on every
+  run (no manual setup needed).
 - RealityScan alignment settings are pinned explicitly via `-set` commands (High feature
   detection quality, 80k max features/image, downscale factor 1, Brown3 distortion,
   camera priors off, 1 mm control-point accuracy, etc.), so runs don't depend on the
@@ -137,10 +154,16 @@ scene will then be unscaled and uncentered.
   actually stop the pipeline and surface as exit codes), `-silent` (no crash-report
   dialogs), `-selectMaximalComponent` (exports always come from the largest alignment
   component), and verifies exported files exist regardless of exit code.
+- Dense init: sparse tie points starve 3DGS initialization (soft results), so by
+  default the script meshes at Preview quality (CPU-based), simplifies to
+  `-DenseTargetTris` triangles (~half that in points, targeting ~1–3M), colorizes, and
+  exports the vertices as the init cloud. The exported PLY is validated (binary, RGB
+  colors, faces stripped if present); on any problem the run falls back to the sparse
+  cloud with a warning. Use `-SparseInit` to A/B the old behavior.
 - Postshot training uses the `Splat MCMC` profile, pinned explicitly (Postshot's
-  default profile changed to `Splat3` in v1.1). Poses and points are recentered to the
-  world origin by Postshot's default behavior — this is a translation only, and the
-  original origin is preserved in the exported PLY metadata.
+  default profile changed to `Splat3` in v1.1), with `--no-recenter-points` so the
+  tag-anchored frame is preserved — tag `00e` at the origin, tag plane at Z = 0
+  (RealityScan +Z-up maps to Postshot +Y-up on import).
 - `postshot-cli` has no photometric compensation flag as of v1.1; enable it in the
   Postshot GUI if needed after opening the project. Postshot's engine log is at
   `%LOCALAPPDATA%\Postshot\Postshot.log` if training fails.
